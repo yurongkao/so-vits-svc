@@ -1,13 +1,14 @@
 import os
 import random
-import re
-import numpy as np
+
 import librosa
+import numpy as np
 import torch
-import random
-from utils import repeat_expand_2d
-from tqdm import tqdm
 from torch.utils.data import Dataset
+from tqdm import tqdm
+
+from utils import repeat_expand_2d
+
 
 def traverse_dir(
         root_dir,
@@ -63,6 +64,7 @@ def get_data_loaders(args, whole_audio=False):
         spk=args.spk,
         device=args.train.cache_device,
         fp16=args.train.cache_fp16,
+        unit_interpolate_mode = args.data.unit_interpolate_mode,
         use_aug=True)
     loader_train = torch.utils.data.DataLoader(
         data_train ,
@@ -81,6 +83,7 @@ def get_data_loaders(args, whole_audio=False):
         whole_audio=True,
         spk=args.spk,
         extensions=args.data.extensions,
+        unit_interpolate_mode = args.data.unit_interpolate_mode,
         n_spk=args.model.n_spk)
     loader_valid = torch.utils.data.DataLoader(
         data_valid,
@@ -107,6 +110,7 @@ class AudioDataset(Dataset):
         device='cpu',
         fp16=False,
         use_aug=False,
+        unit_interpolate_mode = 'left'
     ):
         super().__init__()
         
@@ -118,6 +122,7 @@ class AudioDataset(Dataset):
         self.use_aug = use_aug
         self.data_buffer={}
         self.pitch_aug_dict = {}
+        self.unit_interpolate_mode = unit_interpolate_mode
         # np.load(os.path.join(self.path_root, 'pitch_aug_dict.npy'), allow_pickle=True).item()
         if load_all_data:
             print('Load all the data filelists:', filelists)
@@ -126,7 +131,6 @@ class AudioDataset(Dataset):
         with open(filelists,"r") as f:
             self.paths = f.read().splitlines()
         for name_ext in tqdm(self.paths, total=len(self.paths)):
-            name = os.path.splitext(name_ext)[0]
             path_audio = name_ext
             duration = librosa.get_duration(filename = path_audio, sr = self.sample_rate)
             
@@ -171,7 +175,7 @@ class AudioDataset(Dataset):
                 path_units = name_ext + ".soft.pt"
                 units = torch.load(path_units).to(device)
                 units = units[0]  
-                units = repeat_expand_2d(units,f0.size(0)).transpose(0,1)
+                units = repeat_expand_2d(units,f0.size(0),unit_interpolate_mode).transpose(0,1)
                 
                 if fp16:
                     mel = mel.half()
@@ -263,7 +267,7 @@ class AudioDataset(Dataset):
             path_units = name_ext + ".soft.pt"
             units = torch.load(path_units)
             units = units[0]  
-            units = repeat_expand_2d(units,f0.size(0)).transpose(0,1)
+            units = repeat_expand_2d(units,f0.size(0),self.unit_interpolate_mode).transpose(0,1)
             
         units = units[start_frame : start_frame + units_frame_len]
 

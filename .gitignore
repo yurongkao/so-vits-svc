@@ -10,7 +10,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+checkpoints/
 # Distribution / packaging
 .Python
 build/
@@ -140,6 +140,9 @@ dmypy.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 
+/shelf/
+/workspace.xml
+
 dataset
 dataset_raw
 raw
@@ -147,20 +150,18 @@ results
 inference/chunks_temp.json
 logs
 hubert/checkpoint_best_legacy_500.pt
-pretrain/**/*.pt
 configs/config.json
 filelists/test.txt
 filelists/train.txt
 filelists/val.txt
+.idea/
+.vscode/
 .idea/modules.xml
 .idea/so-vits-svc.iml
 .idea/vcs.xml
 .idea/inspectionProfiles/profiles_settings.xml
 .idea/inspectionProfiles/Project_Default.xml
-pretrain/vec-768-layer-12.onnx
-pretrain/hubert-soft.onnx
-pretrain/hubert4.0.onnx
-pretrain/vec-256-layer-9.onnx
-pretrain/vec-256-layer-12.onnx
-pretrain/vec-768-layer-9.onnx
+pretrain/
 .vscode/launch.json
+
+trained/**/

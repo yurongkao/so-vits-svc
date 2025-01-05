@@ -1,38 +1,29 @@
 import logging
 import multiprocessing
+import os
 import time
 
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
-logging.getLogger('numba').setLevel(logging.WARNING)
-
-import os
-import json
-import argparse
-import itertools
-import math
 import torch
-from torch import nn, optim
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
 
 import modules.commons as commons
 import utils
-from data_utils import TextAudioSpeakerLoader, TextAudioCollate
+from data_utils import TextAudioCollate, TextAudioSpeakerLoader
 from models import (
-    SynthesizerTrn,
     MultiPeriodDiscriminator,
+    SynthesizerTrn,
 )
-from modules.losses import (
-    kl_loss,
-    generator_loss, discriminator_loss, feature_loss
-)
-
+from modules.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('numba').setLevel(logging.WARNING)
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
@@ -61,7 +52,7 @@ def run(rank, n_gpus, hps):
         utils.check_git_hash(hps.model_dir)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
-
+    
     # for pytorch on win, backend use gloo    
     dist.init_process_group(backend=  'gloo' if os.name == 'nt' else 'nccl', init_method='env://', world_size=n_gpus, rank=rank)
     torch.manual_seed(hps.train.seed)
@@ -110,7 +101,7 @@ def run(rank, n_gpus, hps):
         name=utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
         global_step=int(name[name.rfind("_")+1:name.rfind(".")])+1
         #global_step = (epoch_str - 1) * len(train_loader)
-    except:
+    except Exception:
         print("load old checkpoint failed...")
         epoch_str = 1
         global_step = 0
@@ -150,6 +141,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     train_loader, eval_loader = loaders
     if writers is not None:
         writer, writer_eval = writers
+    
+    half_type = torch.bfloat16 if hps.train.half_type=="bf16" else torch.float16
 
     # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
@@ -171,8 +164,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             hps.data.sampling_rate,
             hps.data.mel_fmin,
             hps.data.mel_fmax)
-
-        with autocast(enabled=hps.train.fp16_run):
+        
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
             y_hat, ids_slice, z_mask, \
             (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=g, c_lengths=lengths,
                                                                                 spec_lengths=lengths,vol = volume)
@@ -193,25 +186,26 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-            with autocast(enabled=False):
+            with autocast(enabled=False, dtype=half_type):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
-
+        
         optim_d.zero_grad()
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
+        
 
-        with autocast(enabled=hps.train.fp16_run):
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            with autocast(enabled=False):
+            with autocast(enabled=False, dtype=half_type):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                loss_lf0 = F.mse_loss(pred_lf0, lf0)
+                loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
@@ -243,12 +237,16 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 image_dict = {
                     "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
                     "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
-                    "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
-                    "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                          pred_lf0[0, 0, :].detach().cpu().numpy()),
-                    "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                               norm_lf0[0, 0, :].detach().cpu().numpy())
+                    "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
                 }
+
+                if net_g.module.use_automatic_f0_prediction:
+                    image_dict.update({
+                        "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                              pred_lf0[0, 0, :].detach().cpu().numpy()),
+                        "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                                   norm_lf0[0, 0, :].detach().cpu().numpy())
+                    })
 
                 utils.summarize(
                     writer=writer,
@@ -289,7 +287,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
             c = c[:1].cuda(0)
             f0 = f0[:1].cuda(0)
             uv= uv[:1].cuda(0)
-            if volume!=None:
+            if volume is not None:
                 volume = volume[:1].cuda(0)
             mel = spec_to_mel_torch(
                 spec,
@@ -316,7 +314,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
                 f"gt/audio_{batch_idx}": y[0]
             })
         image_dict.update({
-            f"gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy()),
+            "gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy()),
             "gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())
         })
     utils.summarize(

@@ -1,12 +1,12 @@
-from diffusion_onnx import GaussianDiffusion
 import os
-import yaml
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from wavenet import WaveNet
 import torch.nn.functional as F
-import diffusion
+import yaml
+from diffusion_onnx import GaussianDiffusion
+
 
 class DotDict(dict):
     def __getattr__(*args):         
@@ -33,7 +33,9 @@ def load_model_vocoder(
                 128,
                 args.model.n_layers,
                 args.model.n_chans,
-                args.model.n_hidden)
+                args.model.n_hidden,
+                args.model.timesteps,
+                args.model.k_step_max)
     
     print(' [Loading] ' + model_path)
     ckpt = torch.load(model_path, map_location=torch.device(device))
@@ -52,8 +54,11 @@ class Unit2Mel(nn.Module):
             out_dims=128,
             n_layers=20, 
             n_chans=384, 
-            n_hidden=256):
+            n_hidden=256,
+            timesteps=1000,
+            k_step_max=1000):
         super().__init__()
+
         self.unit_embed = nn.Linear(input_channel, n_hidden)
         self.f0_embed = nn.Linear(1, n_hidden)
         self.volume_embed = nn.Linear(1, n_hidden)
@@ -64,9 +69,13 @@ class Unit2Mel(nn.Module):
         self.n_spk = n_spk
         if n_spk is not None and n_spk > 1:
             self.spk_embed = nn.Embedding(n_spk, n_hidden)
-            
+
+        self.timesteps = timesteps if timesteps is not None else 1000
+        self.k_step_max = k_step_max if k_step_max is not None and k_step_max>0 and k_step_max<self.timesteps else self.timesteps
+
+
         # diffusion
-        self.decoder = GaussianDiffusion(out_dims, n_layers, n_chans, n_hidden)
+        self.decoder = GaussianDiffusion(out_dims, n_layers, n_chans, n_hidden,self.timesteps,self.k_step_max)
         self.hidden_size = n_hidden
         self.speaker_map = torch.zeros((self.n_spk,1,1,n_hidden))
     
@@ -138,8 +147,8 @@ class Unit2Mel(nn.Module):
                 spks.update({i:1.0/float(self.n_spk)})
         spk_mix = torch.tensor(spk_mix)
         spk_mix = spk_mix.repeat(n_frames, 1)
-        orgouttt = self.init_spkembed(hubert, f0.unsqueeze(-1), volume.unsqueeze(-1), spk_mix_dict=spks)
-        outtt = self.forward(hubert, mel2ph, f0, volume, spk_mix)
+        self.init_spkembed(hubert, f0.unsqueeze(-1), volume.unsqueeze(-1), spk_mix_dict=spks)
+        self.forward(hubert, mel2ph, f0, volume, spk_mix)
         if export_encoder:
             torch.onnx.export(
                 self,
@@ -173,8 +182,8 @@ class Unit2Mel(nn.Module):
                 spk_mix.append(1.0/float(self.n_spk))
                 spks.update({i:1.0/float(self.n_spk)})
         spk_mix = torch.tensor(spk_mix)
-        orgouttt = self.orgforward(hubert, f0.unsqueeze(-1), volume.unsqueeze(-1), spk_mix_dict=spks)
-        outtt = self.forward(hubert, mel2ph, f0, volume, spk_mix)
+        self.orgforward(hubert, f0.unsqueeze(-1), volume.unsqueeze(-1), spk_mix_dict=spks)
+        self.forward(hubert, mel2ph, f0, volume, spk_mix)
 
         torch.onnx.export(
                 self,

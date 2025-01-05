@@ -1,9 +1,11 @@
-import os
 import argparse
+
 import torch
+from loguru import logger
 from torch.optim import lr_scheduler
-from diffusion.logger import utils
+
 from diffusion.data_loaders import get_data_loaders
+from diffusion.logger import utils
 from diffusion.solver import train
 from diffusion.unit2mel import Unit2Mel
 from diffusion.vocoder import Vocoder
@@ -27,8 +29,8 @@ if __name__ == '__main__':
     
     # load config
     args = utils.load_config(cmd.config)
-    print(' > config:', cmd.config)
-    print(' >    exp:', args.env.expdir)
+    logger.info(' > config:'+ cmd.config)
+    logger.info(' > exp:'+ args.env.expdir)
     
     # load vocoder
     vocoder = Vocoder(args.vocoder.type, args.vocoder.ckpt, device=args.device)
@@ -41,8 +43,12 @@ if __name__ == '__main__':
                 vocoder.dimension,
                 args.model.n_layers,
                 args.model.n_chans,
-                args.model.n_hidden)
+                args.model.n_hidden,
+                args.model.timesteps,
+                args.model.k_step_max
+                )
     
+    logger.info(f' > Now model timesteps is {model.timesteps}, and k_step_max is {model.k_step_max}')
     
     # load parameters
     optimizer = torch.optim.AdamW(model.parameters())

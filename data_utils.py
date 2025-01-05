@@ -1,14 +1,13 @@
-import time
 import os
 import random
+
 import numpy as np
 import torch
 import torch.utils.data
 
-import modules.commons as commons
 import utils
-from modules.mel_processing import spectrogram_torch, spec_to_mel_torch, spectrogram_torch
-from utils import load_wav_to_torch, load_filepaths_and_text
+from modules.mel_processing import spectrogram_torch
+from utils import load_filepaths_and_text, load_wav_to_torch
 
 # import h5py
 
@@ -31,6 +30,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.filter_length = hparams.data.filter_length
         self.hop_length = hparams.data.hop_length
         self.win_length = hparams.data.win_length
+        self.unit_interpolate_mode = hparams.data.unit_interpolate_mode
         self.sampling_rate = hparams.data.sampling_rate
         self.use_sr = hparams.train.use_sr
         self.spec_len = hparams.train.max_speclen
@@ -48,8 +48,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         filename = filename.replace("\\", "/")
         audio, sampling_rate = load_wav_to_torch(filename)
         if sampling_rate != self.sampling_rate:
-            raise ValueError("{} SR doesn't match target {} SR".format(
-                sampling_rate, self.sampling_rate))
+            raise ValueError(
+                "Sample Rate not match. Expect {} but got {} from {}".format(
+                    self.sampling_rate, sampling_rate, filename))
         audio_norm = audio / self.max_wav_value
         audio_norm = audio_norm.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
@@ -73,7 +74,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         uv = torch.FloatTensor(np.array(uv,dtype=float))
 
         c = torch.load(filename+ ".soft.pt")
-        c = utils.repeat_expand_2d(c.squeeze(0), f0.shape[0])
+        c = utils.repeat_expand_2d(c.squeeze(0), f0.shape[0], mode=self.unit_interpolate_mode)
         if self.vol_emb:
             volume_path = filename + ".vol.npy"
             volume = np.load(volume_path)
@@ -86,7 +87,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         assert abs(audio_norm.shape[1]-lmin * self.hop_length) < 3 * self.hop_length
         spec, c, f0, uv = spec[:, :lmin], c[:, :lmin], f0[:lmin], uv[:lmin]
         audio_norm = audio_norm[:, :lmin * self.hop_length]
-        if volume!= None:
+        if volume is not None:
             volume = volume[:lmin]
         return c, f0, spec, audio_norm, spk, uv, volume
 
@@ -95,7 +96,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         #     print("skip too short audio:", filename)
         #     return None
 
-        if random.choice([True, False]) and self.vol_aug and volume!=None:
+        if random.choice([True, False]) and self.vol_aug and volume is not None:
             max_amp = float(torch.max(torch.abs(audio_norm))) + 1e-5
             max_shift = min(1, np.log10(1/max_amp))
             log10_vol_shift = random.uniform(-1, max_shift)
@@ -113,7 +114,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             end = start + 790
             spec, c, f0, uv = spec[:, start:end], c[:, start:end], f0[start:end], uv[start:end]
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
-            if volume !=None:
+            if volume is not None:
                 volume = volume[start:end]
         return c, f0, spec, audio_norm, spk, uv,volume
 
@@ -177,7 +178,7 @@ class TextAudioCollate:
             uv = row[5]
             uv_padded[i, :uv.size(0)] = uv
             volume = row[6]
-            if volume != None:
+            if volume is not None:
                 volume_padded[i, :volume.size(0)] = volume
             else :
                 volume_padded = None

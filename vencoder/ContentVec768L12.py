@@ -1,9 +1,12 @@
-from vencoder.encoder import SpeechEncoder
 import torch
 from fairseq import checkpoint_utils
 
+from vencoder.encoder import SpeechEncoder
+
+
 class ContentVec768L12(SpeechEncoder):
-    def __init__(self,vec_path = "pretrain/checkpoint_best_legacy_500.pt",device=None):
+    def __init__(self, vec_path="pretrain/checkpoint_best_legacy_500.pt", device=None):
+        super().__init__()
         print("load model(s) from {}".format(vec_path))
         self.hidden_dim = 768
         models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task(
@@ -20,7 +23,7 @@ class ContentVec768L12(SpeechEncoder):
     def encoder(self, wav):
         feats = wav
         if feats.dim() == 2:  # double channels
-          feats = feats.mean(-1)
+            feats = feats.mean(-1)
         assert feats.dim() == 1, feats.dim()
         feats = feats.view(1, -1)
         padding_mask = torch.BoolTensor(feats.shape).fill_(False)
@@ -30,5 +33,5 @@ class ContentVec768L12(SpeechEncoder):
           "output_layer": 12,  # layer 12
         }
         with torch.no_grad():
-          logits = self.model.extract_features(**inputs)
+            logits = self.model.extract_features(**inputs)
         return logits[0].transpose(1, 2)

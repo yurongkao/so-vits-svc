@@ -1,12 +1,14 @@
-import os
 import time
+
+import librosa
 import numpy as np
 import torch
-import librosa
-from diffusion.logger.saver import Saver
-from diffusion.logger import utils
 from torch import autocast
 from torch.cuda.amp import GradScaler
+
+from diffusion.logger import utils
+from diffusion.logger.saver import Saver
+
 
 def test(args, model, vocoder, loader_test, saver):
     print(' [*] testing...')
@@ -40,10 +42,12 @@ def test(args, model, vocoder, loader_test, saver):
                     data['f0'], 
                     data['volume'], 
                     data['spk_id'],
-                    gt_spec=None,
+                    gt_spec=None if model.k_step_max == model.timesteps else data['mel'],
                     infer=True, 
                     infer_speedup=args.infer.speedup, 
-                    method=args.infer.method)
+                    method=args.infer.method,
+                    k_step=model.k_step_max
+                    )
             signal = vocoder.infer(mel, data['f0'])
             ed_time = time.time()
                         
@@ -62,7 +66,8 @@ def test(args, model, vocoder, loader_test, saver):
                     data['volume'], 
                     data['spk_id'], 
                     gt_spec=data['mel'],
-                    infer=False)
+                    infer=False,
+                    k_step=model.k_step_max)
                 test_loss += loss.item()
             
             # log mel
@@ -121,11 +126,11 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
             # forward
             if dtype == torch.float32:
                 loss = model(data['units'].float(), data['f0'], data['volume'], data['spk_id'], 
-                                aug_shift = data['aug_shift'], gt_spec=data['mel'].float(), infer=False)
+                                aug_shift = data['aug_shift'], gt_spec=data['mel'].float(), infer=False, k_step=model.k_step_max)
             else:
                 with autocast(device_type=args.device, dtype=dtype):
                     loss = model(data['units'], data['f0'], data['volume'], data['spk_id'], 
-                                    aug_shift = data['aug_shift'], gt_spec=data['mel'], infer=False)
+                                    aug_shift = data['aug_shift'], gt_spec=data['mel'], infer=False, k_step=model.k_step_max)
             
             # handle nan loss
             if torch.isnan(loss):

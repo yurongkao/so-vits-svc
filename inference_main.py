@@ -1,15 +1,10 @@
-import io
 import logging
-import time
-from pathlib import Path
-from spkmix import spk_mix_map
-import librosa
-import matplotlib.pyplot as plt
-import numpy as np
+
 import soundfile
+
 from inference import infer_tool
-from inference import slicer
 from inference.infer_tool import Svc
+from spkmix import spk_mix_map
 
 logging.getLogger('numba').setLevel(logging.WARNING)
 chunks_dict = infer_tool.read_temp("inference/chunks_temp.json")
@@ -25,20 +20,21 @@ def main():
     parser.add_argument('-m', '--model_path', type=str, default="logs/44k/G_37600.pth", help='模型路径')
     parser.add_argument('-c', '--config_path', type=str, default="logs/44k/config.json", help='配置文件路径')
     parser.add_argument('-cl', '--clip', type=float, default=0, help='音频强制切片，默认0为自动切片，单位为秒/s')
-    parser.add_argument('-n', '--clean_names', type=str, nargs='+', default=["test.wav"], help='wav文件名列表，放在raw文件夹下')
+    parser.add_argument('-n', '--clean_names', type=str, nargs='+', default=["君の知らない物語-src.wav"], help='wav文件名列表，放在raw文件夹下')
     parser.add_argument('-t', '--trans', type=int, nargs='+', default=[0], help='音高调整，支持正负（半音）')
     parser.add_argument('-s', '--spk_list', type=str, nargs='+', default=['buyizi'], help='合成目标说话人名称')
     
     # 可选项部分
     parser.add_argument('-a', '--auto_predict_f0', action='store_true', default=False, help='语音转换自动预测音高，转换歌声时不要打开这个会严重跑调')
-    parser.add_argument('-cm', '--cluster_model_path', type=str, default="logs/44k/kmeans_10000.pt", help='聚类模型路径，如果没有训练聚类则随便填')
-    parser.add_argument('-cr', '--cluster_infer_ratio', type=float, default=0, help='聚类方案占比，范围0-1，若没有训练聚类模型则默认0即可')
+    parser.add_argument('-cm', '--cluster_model_path', type=str, default="", help='聚类模型或特征检索索引路径，留空则自动设为各方案模型的默认路径，如果没有训练聚类或特征检索则随便填')
+    parser.add_argument('-cr', '--cluster_infer_ratio', type=float, default=0, help='聚类方案或特征检索占比，范围0-1，若没有训练聚类模型或特征检索则默认0即可')
     parser.add_argument('-lg', '--linear_gradient', type=float, default=0, help='两段音频切片的交叉淡入长度，如果强制切片后出现人声不连贯可调整该数值，如果连贯建议采用默认值0，单位为秒')
-    parser.add_argument('-f0p', '--f0_predictor', type=str, default="pm", help='选择F0预测器,可选择crepe,pm,dio,harvest,默认为pm(注意：crepe为原F0使用均值滤波器)')
+    parser.add_argument('-f0p', '--f0_predictor', type=str, default="pm", help='选择F0预测器,可选择crepe,pm,dio,harvest,rmvpe,fcpe默认为pm(注意：crepe为原F0使用均值滤波器)')
     parser.add_argument('-eh', '--enhance', action='store_true', default=False, help='是否使用NSF_HIFIGAN增强器,该选项对部分训练集少的模型有一定的音质增强效果，但是对训练好的模型有反面效果，默认关闭')
     parser.add_argument('-shd', '--shallow_diffusion', action='store_true', default=False, help='是否使用浅层扩散，使用后可解决一部分电音问题，默认关闭，该选项打开时，NSF_HIFIGAN增强器将会被禁止')
     parser.add_argument('-usm', '--use_spk_mix', action='store_true', default=False, help='是否使用角色融合')
     parser.add_argument('-lea', '--loudness_envelope_adjustment', type=float, default=1, help='输入源响度包络替换输出响度包络融合比例，越靠近1越使用输出响度包络')
+    parser.add_argument('-fr', '--feature_retrieval', action='store_true', default=False, help='是否使用特征检索，如果使用聚类模型将被禁用，且cm与cr参数将会变成特征检索的索引路径与混合比例')
 
     # 浅扩散设置
     parser.add_argument('-dm', '--diffusion_model_path', type=str, default="logs/44k/diffusion/model_0.pt", help='扩散模型路径')
@@ -86,7 +82,27 @@ def main():
     second_encoding = args.second_encoding
     loudness_envelope_adjustment = args.loudness_envelope_adjustment
 
-    svc_model = Svc(args.model_path, args.config_path, args.device, args.cluster_model_path,enhance,diffusion_model_path,diffusion_config_path,shallow_diffusion,only_diffusion,use_spk_mix)
+    if cluster_infer_ratio != 0:
+        if args.cluster_model_path == "":
+            if args.feature_retrieval:  # 若指定了占比但没有指定模型路径，则按是否使用特征检索分配默认的模型路径
+                args.cluster_model_path = "logs/44k/feature_and_index.pkl"
+            else:
+                args.cluster_model_path = "logs/44k/kmeans_10000.pt"
+    else:  # 若未指定占比，则无论是否指定模型路径，都将其置空以避免之后的模型加载
+        args.cluster_model_path = ""
+
+    svc_model = Svc(args.model_path,
+                    args.config_path,
+                    args.device,
+                    args.cluster_model_path,
+                    enhance,
+                    diffusion_model_path,
+                    diffusion_config_path,
+                    shallow_diffusion,
+                    only_diffusion,
+                    use_spk_mix,
+                    args.feature_retrieval)
+    
     infer_tool.mkdir(["raw", "results"])
     
     if len(spk_mix_map)<=1:
@@ -125,11 +141,13 @@ def main():
             key = "auto" if auto_predict_f0 else f"{tran}key"
             cluster_name = "" if cluster_infer_ratio == 0 else f"_{cluster_infer_ratio}"
             isdiffusion = "sovits"
-            if shallow_diffusion : isdiffusion = "sovdiff"
-            if only_diffusion : isdiffusion = "diff"
-            if type(spk) != type('aa'):
+            if shallow_diffusion :
+                isdiffusion = "sovdiff"
+            if only_diffusion :
+                isdiffusion = "diff"
+            if use_spk_mix:
                 spk = "spk_mix"
-            res_path = f'results/{clean_name}_{key}_{spk}{cluster_name}_{isdiffusion}.{wav_format}'
+            res_path = f'results/{clean_name}_{key}_{spk}{cluster_name}_{isdiffusion}_{f0p}.{wav_format}'
             soundfile.write(res_path, audio, svc_model.target_sample, format=wav_format)
             svc_model.clear_empty()
             

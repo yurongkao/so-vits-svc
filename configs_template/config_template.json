@@ -12,6 +12,7 @@
     "eps": 1e-09,
     "batch_size": 6,
     "fp16_run": false,
+    "half_type": "fp16",
     "lr_decay": 0.999875,
     "segment_size": 10240,
     "init_lr_ratio": 1,
@@ -35,7 +36,8 @@
     "win_length": 2048,
     "n_mel_channels": 80,
     "mel_fmin": 0.0,
-    "mel_fmax": 22050
+    "mel_fmax": 22050,
+    "unit_interpolate_mode":"nearest"
   },
   "model": {
     "inter_channels": 192,
@@ -52,13 +54,20 @@
     "upsample_initial_channel": 512,
     "upsample_kernel_sizes": [16,16, 4, 4, 4],
     "n_layers_q": 3,
+    "n_layers_trans_flow": 3,
+    "n_flow_layer": 4,
     "use_spectral_norm": false,
     "gin_channels": 768,
     "ssl_dim": 768,
     "n_speakers": 200,
+    "vocoder_name":"nsf-hifigan",
     "speech_encoder":"vec768l12",
     "speaker_embedding":false,
-    "vol_embedding":false
+    "vol_embedding":false,
+    "use_depthwise_conv":false,
+    "flow_share_parameter": false,
+    "use_automatic_f0_prediction": true,
+    "use_transformer_flow": false
   },
   "spk": {
     "nyaru": 0,

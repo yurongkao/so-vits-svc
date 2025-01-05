@@ -1,20 +1,16 @@
-import copy
-import math
 import torch
 from torch import nn
+from torch.nn import Conv1d, Conv2d
 from torch.nn import functional as F
+from torch.nn.utils import spectral_norm, weight_norm
 
 import modules.attentions as attentions
 import modules.commons as commons
 import modules.modules as modules
-
-from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-
 import utils
-from modules.commons import init_weights, get_padding
-from vdecoder.hifigan.models import Generator
+from modules.commons import get_padding
 from utils import f0_to_coarse
+
 
 class ResidualCouplingBlock(nn.Module):
     def __init__(self,
@@ -24,7 +20,9 @@ class ResidualCouplingBlock(nn.Module):
                  dilation_rate,
                  n_layers,
                  n_flows=4,
-                 gin_channels=0):
+                 gin_channels=0,
+                 share_parameter=False
+                 ):
         super().__init__()
         self.channels = channels
         self.hidden_channels = hidden_channels
@@ -35,10 +33,53 @@ class ResidualCouplingBlock(nn.Module):
         self.gin_channels = gin_channels
 
         self.flows = nn.ModuleList()
+
+        self.wn = modules.WN(hidden_channels, kernel_size, dilation_rate, n_layers, p_dropout=0, gin_channels=gin_channels) if share_parameter else None
+
         for i in range(n_flows):
             self.flows.append(
                 modules.ResidualCouplingLayer(channels, hidden_channels, kernel_size, dilation_rate, n_layers,
-                                              gin_channels=gin_channels, mean_only=True))
+                                              gin_channels=gin_channels, mean_only=True, wn_sharing_parameter=self.wn))
+            self.flows.append(modules.Flip())
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in reversed(self.flows):
+                x = flow(x, x_mask, g=g, reverse=reverse)
+        return x
+
+class TransformerCouplingBlock(nn.Module):
+    def __init__(self,
+                 channels,
+                 hidden_channels,
+                 filter_channels,
+                 n_heads,
+                 n_layers,
+                 kernel_size,
+                 p_dropout,
+                 n_flows=4,
+                 gin_channels=0,
+                 share_parameter=False
+                 ):
+            
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows = nn.ModuleList()
+
+        self.wn = attentions.FFT(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, isflow = True, gin_channels = self.gin_channels) if share_parameter else None
+
+        for i in range(n_flows):
+            self.flows.append(
+                modules.TransformerCouplingLayer(channels, hidden_channels, kernel_size, n_layers, n_heads, p_dropout, filter_channels, mean_only=True, wn_sharing_parameter=self.wn, gin_channels = self.gin_channels))
             self.flows.append(modules.Flip())
 
     def forward(self, x, x_mask, g=None, reverse=False):
@@ -120,29 +161,20 @@ class TextEncoder(nn.Module):
 
         return z, m, logs, x_mask
 
+
 class DiscriminatorP(torch.nn.Module):
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
         super(DiscriminatorP, self).__init__()
         self.period = period
         self.use_spectral_norm = use_spectral_norm
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
-
-        self.depthwise_convs = nn.ModuleList([
-            norm_f(Conv2d(1, 1, (kernel_size, 1), (stride, 1), groups=1, padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(32, 32, (kernel_size, 1), (stride, 1), groups=32, padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(128, 128, (kernel_size, 1), (stride, 1), groups=128, padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(512, 512, (kernel_size, 1), (stride, 1), groups=512, padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(1024, 1024, (kernel_size, 1), 1, groups=1024, padding=(get_padding(kernel_size, 1), 0))),
+        norm_f = weight_norm if use_spectral_norm is False else spectral_norm
+        self.convs = nn.ModuleList([
+            norm_f(Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(get_padding(kernel_size, 1), 0))),
         ])
-
-        self.pointwise_convs = nn.ModuleList([
-            norm_f(Conv2d(1, 32, (1, 1))),
-            norm_f(Conv2d(32, 128, (1, 1))),
-            norm_f(Conv2d(128, 512, (1, 1))),
-            norm_f(Conv2d(512, 1024, (1, 1))),
-            norm_f(Conv2d(1024, 1024, (1, 1))),
-        ])
-
         self.conv_post = norm_f(Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
 
     def forward(self, x):
@@ -150,27 +182,27 @@ class DiscriminatorP(torch.nn.Module):
 
         # 1d to 2d
         b, c, t = x.shape
-        if t % self.period != 0: # pad first
+        if t % self.period != 0:  # pad first
             n_pad = self.period - (t % self.period)
             x = F.pad(x, (0, n_pad), "reflect")
             t = t + n_pad
         x = x.view(b, c, t // self.period, self.period)
 
-        for depthwise_conv, pointwise_conv in zip(self.depthwise_convs, self.pointwise_convs):
-            x = depthwise_conv(x)
+        for l in self.convs:
+            x = l(x)
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
-            x = pointwise_conv(x)
             fmap.append(x)
-
         x = self.conv_post(x)
         fmap.append(x)
         x = torch.flatten(x, 1, -1)
 
         return x, fmap
+
+
 class DiscriminatorS(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
         super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = weight_norm if use_spectral_norm is False else spectral_norm
         self.convs = nn.ModuleList([
             norm_f(Conv1d(1, 16, 15, 1, padding=7)),
             norm_f(Conv1d(16, 64, 41, 4, groups=4, padding=20)),
@@ -330,6 +362,13 @@ class SynthesizerTrn(nn.Module):
                  n_speakers,
                  sampling_rate=44100,
                  vol_embedding=False,
+                 vocoder_name = "nsf-hifigan",
+                 use_depthwise_conv = False,
+                 use_automatic_f0_prediction = True,
+                 flow_share_parameter = False,
+                 n_flow_layer = 4,
+                 n_layers_trans_flow = 3,
+                 use_transformer_flow = False,
                  **kwargs):
 
         super().__init__()
@@ -352,6 +391,9 @@ class SynthesizerTrn(nn.Module):
         self.ssl_dim = ssl_dim
         self.vol_embedding = vol_embedding
         self.emb_g = nn.Embedding(n_speakers, gin_channels)
+        self.use_depthwise_conv = use_depthwise_conv
+        self.use_automatic_f0_prediction = use_automatic_f0_prediction
+        self.n_layers_trans_flow = n_layers_trans_flow
         if vol_embedding:
            self.emb_vol = nn.Linear(1, hidden_channels)
 
@@ -376,20 +418,38 @@ class SynthesizerTrn(nn.Module):
             "upsample_initial_channel": upsample_initial_channel,
             "upsample_kernel_sizes": upsample_kernel_sizes,
             "gin_channels": gin_channels,
+            "use_depthwise_conv":use_depthwise_conv
         }
-        self.dec = Generator(h=hps)
+        
+        modules.set_Conv1dModel(self.use_depthwise_conv)
+
+        if vocoder_name == "nsf-hifigan":
+            from vdecoder.hifigan.models import Generator
+            self.dec = Generator(h=hps)
+        elif vocoder_name == "nsf-snake-hifigan":
+            from vdecoder.hifiganwithsnake.models import Generator
+            self.dec = Generator(h=hps)
+        else:
+            print("[?] Unkown vocoder: use default(nsf-hifigan)")
+            from vdecoder.hifigan.models import Generator
+            self.dec = Generator(h=hps)
+
         self.enc_q = Encoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
-        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
-        self.f0_decoder = F0Decoder(
-            1,
-            hidden_channels,
-            filter_channels,
-            n_heads,
-            n_layers,
-            kernel_size,
-            p_dropout,
-            spk_channels=gin_channels
-        )
+        if use_transformer_flow:
+            self.flow = TransformerCouplingBlock(inter_channels, hidden_channels, filter_channels, n_heads, n_layers_trans_flow, 5, p_dropout, n_flow_layer,  gin_channels=gin_channels, share_parameter= flow_share_parameter)
+        else:
+            self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, n_flow_layer, gin_channels=gin_channels, share_parameter= flow_share_parameter)
+        if self.use_automatic_f0_prediction:
+            self.f0_decoder = F0Decoder(
+                1,
+                hidden_channels,
+                filter_channels,
+                n_heads,
+                n_layers,
+                kernel_size,
+                p_dropout,
+                spk_channels=gin_channels
+            )
         self.emb_uv = nn.Embedding(2, hidden_channels)
         self.character_mix = False
 
@@ -404,17 +464,21 @@ class SynthesizerTrn(nn.Module):
         g = self.emb_g(g).transpose(1,2)
 
         # vol proj
-        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol!=None and self.vol_embedding else 0
+        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
 
         # ssl prenet
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
         x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1,2) + vol
-
+        
         # f0 predict
-        lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
-        norm_lf0 = utils.normalize_f0(lf0, x_mask, uv)
-        pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
-
+        if self.use_automatic_f0_prediction:
+            lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
+            norm_lf0 = utils.normalize_f0(lf0, x_mask, uv)
+            pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
+        else:
+            lf0 = 0
+            norm_lf0 = 0
+            pred_lf0 = 0
         # encoder
         z_ptemp, m_p, logs_p, _ = self.enc_p(x, x_mask, f0=f0_to_coarse(f0))
         z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
@@ -428,6 +492,7 @@ class SynthesizerTrn(nn.Module):
 
         return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0
 
+    @torch.no_grad()
     def infer(self, c, f0, uv, g=None, noice_scale=0.35, seed=52468, predict_f0=False, vol = None):
 
         if c.device == torch.device("cuda"):
@@ -449,11 +514,13 @@ class SynthesizerTrn(nn.Module):
         
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
         # vol proj
-        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol!=None and self.vol_embedding else 0
-           
-        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1,2) + vol
         
-        if predict_f0:
+        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
+
+        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol
+
+        
+        if self.use_automatic_f0_prediction and predict_f0:
             lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
             norm_lf0 = utils.normalize_f0(lf0, x_mask, uv, random_scale=False)
             pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
@@ -463,3 +530,4 @@ class SynthesizerTrn(nn.Module):
         z = self.flow(z_p, c_mask, g=g, reverse=True)
         o = self.dec(z * c_mask, g=g, f0=f0)
         return o,f0
+

@@ -2,15 +2,15 @@
 author: wayn391@mastertones
 '''
 
-import os
-import json
-import time
-import yaml
 import datetime
-import torch
+import os
+import time
+
 import matplotlib.pyplot as plt
-from . import utils
+import torch
+import yaml
 from torch.utils.tensorboard import SummaryWriter
+
 
 class Saver(object):
     def __init__(
@@ -125,12 +125,7 @@ class Saver(object):
             torch.save({
                 'global_step': self.global_step,
                 'model': model.state_dict()}, path_pt)
-            
-        # to json
-        if to_json:
-            path_json = os.path.join(
-                self.expdir , name+'.json')
-            utils.to_json(path_params, path_json)
+        
     
     def delete_model(self, name='model', postfix=''):
         # path

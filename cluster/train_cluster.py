@@ -66,13 +66,14 @@ if __name__ == "__main__":
     dataset = args.dataset
     use_gpu = args.gpu
     n_clusters = 10000
+
     
     ckpt = {}
     for spk in os.listdir(dataset):
         if os.path.isdir(dataset/spk):
             print(f"train kmeans for {spk}...")
             in_dir = dataset/spk
-            x = train_cluster(in_dir, n_clusters,use_minibatch=False,verbose=False,use_gpu=use_gpu)
+            x = train_cluster(in_dir, n_clusters,use_minibatch=True,verbose=False,use_gpu=use_gpu)
             ckpt[spk] = x
 
     checkpoint_path = checkpoint_dir / f"kmeans_{n_clusters}.pt"
